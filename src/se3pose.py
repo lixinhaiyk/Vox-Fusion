@@ -22,11 +22,11 @@ class OptimizablePose(nn.Module):
         return Rt
 
     def rotation(self):
-        w = self.data[3:]
+        w = self.data[3:]  ### 位移在前，旋转在后
         wx = self.skew_symmetric(w)
         theta = w.norm(dim=-1)[..., None, None]
         I = torch.eye(3, device=w.device, dtype=torch.float32)
-        A = self.taylor_A(theta)
+        A = self.taylor_A(theta)### 用泰勒展开的好处是什么
         B = self.taylor_B(theta)
         R = I+A*wx+B*wx@wx
         return R

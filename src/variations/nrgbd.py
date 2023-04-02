@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
 
 
 class GaussianFourierFeatureTransform(torch.nn.Module):
@@ -28,7 +29,118 @@ class GaussianFourierFeatureTransform(torch.nn.Module):
         assert x.dim() == 2, 'Expected 2D input (got {}D input)'.format(x.dim())
         x = x @ self._B.to(x.device)
         return torch.sin(x)
+    
+    
+BOX_OFFSETS = torch.tensor([[[i,j,k] for i in [0, 1] for j in [0, 1] for k in [0, 1]]],
+                               device='cuda')
+class HashEmbedder(nn.Module):
+    def __init__(self, n_levels=2, n_features_per_level=2,\
+                log2_hashmap_size=1, base_resolution=1, finest_resolution=3):
+        super(HashEmbedder, self).__init__()
+        self.total_time = 0
+        self.cnt = 0
+        self.n_levels = n_levels
+        self.n_features_per_level = n_features_per_level
+        self.log2_hashmap_size = log2_hashmap_size
+        self.base_resolution = torch.tensor(base_resolution)
+        self.finest_resolution = torch.tensor(finest_resolution)
+        self.out_dim = self.n_levels * self.n_features_per_level
+        self.embedding_size = (self.n_levels * self.n_features_per_level)*3
 
+        #self.b = torch.exp((torch.log(self.finest_resolution)-torch.log(self.base_resolution))/(n_levels-1))
+        self.b = torch.tensor(self.finest_resolution).float()
+
+        self.embeddings = nn.ModuleList([nn.Embedding(2,2) for i in range(3)]+[nn.Embedding(4,2) for i in range(3)])
+        # custom uniform initialization
+        for i in range(n_levels):
+            nn.init.uniform_(self.embeddings[i].weight, a=-0.0001, b=0.0001)
+            # self.embeddings[i].weight.data.zero_()
+
+    
+    def get_voxel_vertices(xyz, bounding_box, resolution, log2_hashmap_size):
+        xyz = xyz.squeeze()
+        '''
+        xyz: 3D coordinates of samples. B x 3
+        bounding_box: min and max x,y,z coordinates of object bbox
+        resolution: number of voxels per axis
+        '''
+        box_min, box_max = bounding_box
+
+        if not torch.all(xyz <= box_max) or not torch.all(xyz >= box_min):
+            # print("ALERT: some points are outside bounding box. Clipping them!")
+            #pdb.set_trace()
+            xyz = torch.clamp(xyz, min=box_min, max=box_max)
+
+        grid_size = (box_max-box_min)/resolution
+        
+        bottom_left_idx = torch.floor((xyz-box_min)/grid_size).int()
+        voxel_min_vertex = bottom_left_idx*grid_size + box_min
+        voxel_max_vertex = voxel_min_vertex + torch.tensor([1.0,1.0,1.0],device='cuda:0')*grid_size
+
+        # hashed_voxel_indices = [] # B x 8 ... 000,001,010,011,100,101,110,111
+        # for i in [0, 1]:
+        #     for j in [0, 1]:
+        #         for k in [0, 1]:
+        #             vertex_idx = bottom_left_idx + torch.tensor([i,j,k])
+        #             # vertex = bottom_left + torch.tensor([i,j,k])*grid_size
+        #             hashed_voxel_indices.append(hash(vertex_idx, log2_hashmap_size))
+
+        voxel_indices = bottom_left_idx.unsqueeze(1) + BOX_OFFSETS
+        #hashed_voxel_indices = voxel_indices.mean(-1)
+        #hashed_voxel_indices = hash(voxel_indices, log2_hashmap_size)
+        #hashed_voxel_indices = hash2(voxel_indices, log2_hashmap_size)
+        hashed_voxel_indices = voxel_indices.clamp(0,resolution).int()
+        return voxel_min_vertex, voxel_max_vertex, hashed_voxel_indices
+
+    def trilinear_interp(self, x, voxel_min_vertex, voxel_max_vertex, voxel_embedds):
+        '''
+        x: B x 3
+        voxel_min_vertex: B x 3
+        voxel_max_vertex: B x 3
+        voxel_embedds: B x 8 x 2
+        '''
+        x = x.squeeze()
+        # source: https://en.wikipedia.org/wiki/Trilinear_interpolation
+        weights = (x - voxel_min_vertex)/(voxel_max_vertex-voxel_min_vertex) # B x 3
+
+        # step 1
+        # 0->000, 1->001, 2->010, 3->011, 4->100, 5->101, 6->110, 7->111
+        c00 = voxel_embedds[:,0]*(1-weights[:,0][:,None]) + voxel_embedds[:,4]*weights[:,0][:,None]
+        c01 = voxel_embedds[:,1]*(1-weights[:,0][:,None]) + voxel_embedds[:,5]*weights[:,0][:,None]
+        c10 = voxel_embedds[:,2]*(1-weights[:,0][:,None]) + voxel_embedds[:,6]*weights[:,0][:,None]
+        c11 = voxel_embedds[:,3]*(1-weights[:,0][:,None]) + voxel_embedds[:,7]*weights[:,0][:,None]
+
+        # step 2
+        c0 = c00*(1-weights[:,1][:,None]) + c10*weights[:,1][:,None]
+        c1 = c01*(1-weights[:,1][:,None]) + c11*weights[:,1][:,None]
+
+        # step 3
+        c = c0*(1-weights[:,2][:,None]) + c1*weights[:,2][:,None]
+
+        return c
+
+    def forward(self, x):
+        begin_time = time.time()
+        # x is 3D point position: B x 3
+        x_embedded_all = []
+        for i in range(self.n_levels):
+            resolution = torch.floor(self.b**i)
+            voxel_min_vertex, voxel_max_vertex, hashed_voxel_indices = self.get_voxel_vertices(\
+                                                x, self.bounding_box, \
+                                                resolution, self.log2_hashmap_size)
+            for j in range(hashed_voxel_indices.shape[-1]):
+                t_voxl_indices = hashed_voxel_indices[...,j]
+                voxel_embedds = self.embeddings[i*3+j](t_voxl_indices)
+                x_embedded = self.trilinear_interp(x, voxel_min_vertex, voxel_max_vertex, voxel_embedds)
+                x_embedded_all.append(x_embedded)
+
+        res = torch.cat(x_embedded_all, dim=-1)
+        # end_time = time.time()
+        # self.total_time += (end_time-begin_time)
+        # self.cnt = self.cnt +1
+        # print("fourier {}",self.total_time/self.cnt)
+        
+        return res 
 
 class Nerf_positional_embedding(torch.nn.Module):
     """
@@ -85,7 +197,7 @@ class Decoder(nn.Module):
                  sdf_dim=128,
                  skips=[4],
                  multires=6,
-                 embedder='nerf',
+                 embedder='sip',
                  local_coord=False,
                  **kwargs):
         """
@@ -100,6 +212,8 @@ class Decoder(nn.Module):
             self.pe = Same(in_dim)
         elif embedder == 'gaussian':
             self.pe = GaussianFourierFeatureTransform(in_dim)
+        elif embedder == 'sip':
+            self.pe = HashEmbedder()
         else:
             raise NotImplementedError("unknown positional encoder")
 

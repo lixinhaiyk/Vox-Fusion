@@ -1,5 +1,5 @@
 base_config: configs/replica/replica.yaml
-
+log_dir: './logs'
 exp_name: replica/room0
 
 # seeding: 42

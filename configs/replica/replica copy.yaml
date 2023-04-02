@@ -7,7 +7,7 @@ criteria:
   depth_weight: 1
   sdf_weight: 5000.0
   fs_weight: 10.0
-  sdf_truncation: 0.05
+  sdf_truncation: 0.1
 
 decoder_specs:
   depth: 2
@@ -22,7 +22,7 @@ tracker_specs:
   learning_rate: 0.01
   start_frame: 0
   end_frame: -1
-  step_size: 0.05
+  step_size: 0.1
   show_imgs: False
   max_voxel_hit: 10
   keyframe_freq: 10
@@ -33,7 +33,7 @@ mapper_specs:
   num_embeddings: 20000
   use_local_coord: False
   voxel_size: 0.2
-  step_size: 0.05
+  step_size: 0.1
   window_size: 4
   num_iterations: 10
   max_voxel_hit: 10
